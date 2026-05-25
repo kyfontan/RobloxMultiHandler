@@ -2,26 +2,50 @@
 #include "process.h"
 #include <shlobj.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-/* Substrings that mark a *real* unwanted disconnect in the Player log.
+/* Roblox logs a disconnect on EVERY server transition -- including voluntary
+ * ones (leaving, teleporting, the loading hand-off between servers). Matching
+ * generic text like "Connection lost" / "Disconnection Notification" therefore
+ * fires while a game is merely loading, and since we then relaunch -> rejoin ->
+ * the new load disconnects again, it loops forever.
  *
- * These appear only at an actual disconnect (verified against live logs):
- *   [FLog::Network] Connection lost: ...
- *   [FLog::Network] Disconnection Notification. Reason: <code>
- *   [DFLog::RbxTransport...] Disconnected from server for reason: ...
+ * The reliable signal is the disconnect REASON CODE, verified against live logs:
+ *   285 = clean client-initiated disconnect (leave / teleport / shutdown);
+ *         always paired with "connectMode: Disconnect ASAP", AckTimeout 0.
+ *         MUST be ignored -- this was the loop cause.
+ *   277 = real network loss: "Connection lost - Cannot contact server/client",
+ *         connectMode: Connected, AckTimeout 1. A genuine crash to recover from.
  *
- * Do NOT list channel names such as "NetworkClient": that token is printed
- * in every healthy session ("NetworkClient:Create", "[DFLog::NetworkClient]
- * Transport selection..."), so matching it fired a false crash within ~2s of
- * every launch and produced an endless reconnect loop. Likewise the old
- * "GameClient.*disconnected" was a regex the literal strstr() never matched. */
-static const char *kErrorSubstrings[] = {
-    "Connection lost",
-    "Disconnection Notification",
-    "Disconnected from server",
-    "TeleportFailed",
-    "Teleport failed",
+ * So: treat a disconnect as a real crash only when its reason code is NOT a
+ * known voluntary one, plus the unambiguous "Cannot contact server" text and a
+ * failed teleport. Channel names such as "NetworkClient" are never matched
+ * (they appear in every healthy session). */
+
+/* Returns 1 if this disconnect reason code is voluntary/clean (do NOT restart). */
+static int reason_is_voluntary(int code) {
+    switch (code) {
+    case 0:     /* no error                                      */
+    case 285:   /* client-initiated clean disconnect (leave/teleport/shutdown) */
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+/* Reads the first integer following a "reason:"/"Reason:" marker. */
+static int parse_reason_code(const char *after_marker) {
+    const char *p = after_marker;
+    while (*p && (*p < '0' || *p > '9')) p++;
+    return (*p) ? atoi(p) : -1;
+}
+
+/* Disconnect-with-reason markers; the code follows the last ':' on the line. */
+static const char *kReasonMarkers[] = {
+    "Disconnection Notification. Reason:",
+    "disconnect with reason:",
+    "Disconnected from server for reason: Player:",
     NULL
 };
 
@@ -94,14 +118,29 @@ static int log_contains_error(rh_crash_ctx *c, char *reason, int rcap) {
     int hit = 0;
     while (ReadFile(c->log_file, buf, sizeof(buf) - 1, &r, NULL) && r > 0) {
         buf[r] = 0;
-        for (int i = 0; kErrorSubstrings[i]; i++) {
-            char *p = strstr(buf, kErrorSubstrings[i]);
-            if (p) {
-                snprintf(reason, rcap, "log: %s", kErrorSubstrings[i]);
-                hit = 1;
-                break;
+
+        if (strstr(buf, "Cannot contact server")) {
+            /* Real network loss (the 277 case). */
+            snprintf(reason, rcap, "log: connection lost (cannot contact server)");
+            hit = 1;
+        } else if (strstr(buf, "TeleportFailed") || strstr(buf, "Teleport failed")) {
+            snprintf(reason, rcap, "log: teleport failed");
+            hit = 1;
+        } else {
+            /* A disconnect carrying a reason code: restart only if involuntary
+               (e.g. ignore 285 = clean leave/teleport, which loops on loads). */
+            for (int i = 0; kReasonMarkers[i]; i++) {
+                char *p = strstr(buf, kReasonMarkers[i]);
+                if (!p) continue;
+                int code = parse_reason_code(p + strlen(kReasonMarkers[i]));
+                if (code >= 0 && !reason_is_voluntary(code)) {
+                    snprintf(reason, rcap, "log: disconnect (reason %d)", code);
+                    hit = 1;
+                }
+                break;  /* a disconnect line was found; if voluntary, ignore it */
             }
         }
+
         c->log_offset.QuadPart += r;
         if (hit) break;
         if (r < sizeof(buf) - 1) break;
