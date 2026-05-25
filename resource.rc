@@ -1,0 +1,5 @@
+#include <windows.h>
+
+/* App manifest + icon. All dialogs are gone -- ImGui owns the UI now. */
+1 24 "app.manifest"
+101 ICON "imgs/icon.ico"
